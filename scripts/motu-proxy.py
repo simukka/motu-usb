@@ -10,23 +10,34 @@ Protocol summary (from usbmon capture + HAR reverse engineering):
   ┌──────────────────────────────────────────────────────────────────┐
   │ Outer frame (4 bytes, every packet)                              │
   │  [0]    seq       u8    — counter; OUT: 0x20+, IN: 0x54+        │
-  │  [1]    flags     u8    — 0x80=data OUT, 0x81=PING, 0x00=resp   │
+  │  [1]    flags     u8    — 0x80=data OUT, 0x81=PING,             │
+  │                           0x82=CONNECT (session open), 0x00=IN  │
   │  [2-3]  total_len u16LE — full packet length                     │
   ├──────────────────────────────────────────────────────────────────┤
-  │ PING  (OUT, 4 bytes):  [seq] 0x81 0x04 0x00                     │
-  │ ACK   (IN,  8 bytes):  [seq] 0x00 0x08 0x00  × 2  (echoes seq) │
+  │ CONNECT (OUT, 4 bytes):  [seq] 0x82 0x04 0x00  ← first packet   │
+  │ PING    (OUT, 4 bytes):  [seq] 0x81 0x04 0x00                   │
+  │ ACK     (IN,  8 bytes):  [seq] 0x00 0x08 0x00  × 2 (echoes seq)│
   ├──────────────────────────────────────────────────────────────────┤
   │ Data frame header (bytes 4-31, both msg types):                  │
   │  [4-7]   msg_type    4cc  — b"NREK" or b"PTTH"                  │
   │  [8-11]  session_id  u32  — random nonce per channel             │
-  │  [12-15] msg_seq     u32  — per-channel counter                  │
-  │  [16-19] constant    u32  — always 1                             │
-  │  [20-21] pad         u16  — always 0                             │
-  │  [22-23] payload_len u16  — len(payload); total_len = 24+paylen  │
+  │  [12-15] msg_seq     u32  — per-channel counter (LE)             │
+  │  [16-19] direction   u32  — 1=OUT (request), 0=IN (response)     │
+  │  [20-21] chunk_idx   u16  — always 0 (inner header only appears once,   │
+  │                             in the first USB packet of each transfer)    │
+  │  [22-23] payload_len u16  — bytes of payload in the FULL logical frame,  │
+  │                             = total_len − 32 (4 outer + 28 inner)        │
   │  [24-27] motu_magic  4cc  — b"UTOM" (MOTU little-endian)        │
   │  [28-31] inner_hdr   u32  — always 8                             │
   │  [32…]   payload          — binary-serialized HTTP (see codec)   │
   └──────────────────────────────────────────────────────────────────┘
+  Large IN responses (e.g. initial /datastore dump ≥ 4 KiB) are delivered
+  as a single USB bulk transfer spanning multiple 512-byte USB packets.
+  The outer+inner header appears only in the FIRST packet; subsequent packets
+  are raw body continuation with no headers.
+  libusb (via pyusb read()) reassembles these automatically: a single
+  read(EP_BULK_IN, 131072) call returns the complete transfer once the device
+  signals end-of-transfer with a short packet or ZLP.
 
 Payload format (NOT raw HTTP; both PTTH and NREK share this encoding):
   REQUEST  (OUT, bytes 32…):
@@ -77,7 +88,13 @@ EP_BULK_OUT = 0x04   # EP4 OUT
 
 MOTU_MAGIC    = b"UTOM"   # b"MOTU" stored LE
 INNER_HDR_VAL = 8
-CONSTANT_1    = 1
+DIRECTION_OUT = 1          # bytes [16-19] of inner header: 1=OUT, 0=IN
+CHUNK_NONE    = 0          # bytes [20-21]: always 0 (header appears only once per transfer)
+
+# libusb reassembles multi-packet bulk transfers automatically.  We just need
+# a buffer large enough for the largest expected response.
+# payload_len is u16 (max 65535), so max frame = 4 + 28 + 65535 + 4 = 65571 bytes.
+USB_READ_BUFSIZE = 131072  # 128 KiB — comfortably above the 65571-byte max frame
 
 PING_INTERVAL_S  = 1.0    # seconds between keepalive PINGs
 NREK_TIMEOUT_S   = 30.0   # seconds to wait for a NREK long-poll response
@@ -88,21 +105,35 @@ logger = logging.getLogger("motu-proxy")
 
 
 # ─── Frame builders ────────────────────────────────────────────────────────────
+def make_connect(seq: int) -> bytes:
+    """4-byte CONNECT packet (flags=0x82) — must be the very first OUT packet."""
+    return bytes([seq & 0xFF, 0x82, 0x04, 0x00])
+
+
 def make_ping(seq: int) -> bytes:
-    """4-byte PING keepalive."""
+    """4-byte PING keepalive (flags=0x81)."""
     return bytes([seq & 0xFF, 0x81, 0x04, 0x00])
 
 
 def make_data_frame(seq: int, msg_type: bytes, session_id: int,
                     msg_seq: int, payload: bytes) -> bytes:
-    """Build a NREK or PTTH data frame."""
+    """Build a NREK or PTTH data frame.
+
+    Frame layout:
+      [0-3]  outer header: seq, 0x80, total_len(u16LE)
+      [4-31] inner header: msg_type(4cc), session_id(u32), msg_seq(u32),
+                           direction=1(u32), chunk_idx=0(u16), payload_len(u16),
+                           MOTU_MAGIC(4cc), inner_hdr=8(u32)
+      [32…]  payload
+    total_len = 32 + len(payload)  (4 outer + 28 inner + payload)
+    """
     assert len(msg_type) == 4
     payload_len = len(payload)
-    total_len   = 24 + payload_len
+    total_len   = 32 + payload_len   # 4 outer + 28 inner + payload
     outer  = struct.pack("<BBH", seq & 0xFF, 0x80, total_len)
     inner  = (msg_type
               + struct.pack("<II", session_id, msg_seq)
-              + struct.pack("<IHH", CONSTANT_1, 0, payload_len)
+              + struct.pack("<IHH", DIRECTION_OUT, CHUNK_NONE, payload_len)
               + MOTU_MAGIC
               + struct.pack("<I", INNER_HDR_VAL))
     return outer + inner + payload
@@ -157,8 +188,9 @@ def decode_response(data: bytes) -> "tuple[int, list[tuple[str,str]], bytes]":
 
 # ─── Frame parser ─────────────────────────────────────────────────────────────
 class ParsedFrame:
-    __slots__ = ("seq", "flags", "total_len", "is_ack",
-                 "msg_type", "session_id", "msg_seq", "payload_len", "payload")
+    __slots__ = ("seq", "flags", "total_len", "is_ack", "is_connect",
+                 "msg_type", "session_id", "msg_seq", "chunk_idx",
+                 "payload_len", "payload")
 
     def __init__(self, raw: bytes, usb_len: int):
         if len(raw) < 4:
@@ -167,11 +199,21 @@ class ParsedFrame:
         self.flags     = raw[1]
         self.total_len = struct.unpack_from("<H", raw, 2)[0]
 
+        # CONNECT: 4-byte session-open packet (flags=0x82)
+        if usb_len == 4 and self.flags == 0x82:
+            self.is_connect = True
+            self.is_ack = False
+            self.msg_type = self.session_id = self.msg_seq = None
+            self.chunk_idx = self.payload_len = self.payload = None
+            return
+
+        self.is_connect = False
+
         # 8-byte ACK echoes the OUT seq
         if usb_len == 8 and self.flags == 0x00:
             self.is_ack = True
             self.msg_type = self.session_id = self.msg_seq = None
-            self.payload_len = self.payload = None
+            self.chunk_idx = self.payload_len = self.payload = None
             return
 
         self.is_ack = False
@@ -180,6 +222,7 @@ class ParsedFrame:
         self.msg_type    = raw[4:8]
         self.session_id  = struct.unpack_from("<I", raw, 8)[0]
         self.msg_seq     = struct.unpack_from("<I", raw, 12)[0]
+        self.chunk_idx   = struct.unpack_from("<H", raw, 20)[0]  # 0=OUT or first; increments for large IN chunks
         self.payload_len = struct.unpack_from("<H", raw, 22)[0]
         # Device IN responses carry a 4-byte footer (outer header copy) at total_len-4.
         # Payload is raw[32 … total_len-4]; OUT frames have no footer.
@@ -190,10 +233,13 @@ class ParsedFrame:
             self.payload = raw[32:] if len(raw) > 32 else b""
 
     def __repr__(self) -> str:
+        if self.is_connect:
+            return f"<CONNECT seq=0x{self.seq:02x}>"
         if self.is_ack:
             return f"<ACK seq=0x{self.seq:02x}>"
         t = self.msg_type.decode("ascii", errors="?") if self.msg_type else "?"
-        return (f"<{t} seq=0x{self.seq:02x} msg_seq={self.msg_seq} "
+        chunk = f" chunk={self.chunk_idx}" if self.chunk_idx else ""
+        return (f"<{t} seq=0x{self.seq:02x} msg_seq={self.msg_seq}{chunk} "
                 f"payload_len={self.payload_len}>")
 
 
@@ -251,6 +297,11 @@ class MotuDevice:
         """Claim the USB interface and start background threads."""
         self._claim_interface()
         self._reader.start()
+        # Send CONNECT (flags=0x82) as the very first OUT packet — the device
+        # expects this before any PING or data frames.
+        seq = self._next_seq()
+        self._dev.write(EP_BULK_OUT, make_connect(seq), USB_TIMEOUT_MS)
+        logger.debug("[%s] CONNECT seq=0x%02x", self.serial, seq)
         self._pinger.start()
         if self._enable_nrek:
             self._nreker.start()
@@ -343,7 +394,7 @@ class MotuDevice:
         logger.debug("[%s] Reader thread started", self.serial)
         while not self._stop.is_set():
             try:
-                raw = bytes(self._dev.read(EP_BULK_IN, 65536, USB_TIMEOUT_MS))
+                raw = bytes(self._dev.read(EP_BULK_IN, USB_READ_BUFSIZE, USB_TIMEOUT_MS))
             except usb.core.USBTimeoutError:
                 continue
             except Exception as exc:
@@ -363,7 +414,11 @@ class MotuDevice:
             if self._verbose:
                 logger.debug("[%s] IN  %s", self.serial, frame)
 
-            if frame.is_ack:
+            if frame.is_connect:
+                # CONNECT echo — nothing to do
+                logger.debug("[%s] CONNECT echo", self.serial)
+
+            elif frame.is_ack:
                 # Deliver ACK to the waiting OUT operation
                 with self._ack_lock:
                     q = self._ack_queues.get(frame.seq)
@@ -380,6 +435,8 @@ class MotuDevice:
                                    self.serial, frame.msg_seq)
 
             elif frame.msg_type == b"NREK":
+                # libusb already returned the complete transfer in one read() call.
+                # Just deliver the payload directly to the waiting queue.
                 with self._nrek_lock:
                     q = self._nrek_pending.get(frame.msg_seq)
                 if q:

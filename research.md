@@ -338,3 +338,11 @@ Every data packet inner frame (bytes 4–31):
 [24-27] = "MOTU" magic
 [28-31] = 0x08000000
 [32…] = raw HTTP (for PTTH) or keepalive data (for NREK)
+
+## NOTE
+usbmon captures at the USB packet level (max 512 bytes per packet), not the USB bulk transfer level. 
+The analyze-capture.py script treats each 512-byte JSONL line as an independent frame, but large responses 
+are actually a single logical transfer — one outer+inner header in the first 512-byte URB, followed by 
+raw body continuation in subsequent URBs with no repeated headers.
+
+The read(EP_BULK_IN, 65536) via libusb operates at the transfer level and should receive complete frames.

@@ -1,0 +1,20 @@
+[package]
+name = "motu-usb"
+version = "0.1.0"
+edition = "2024"
+description = "Async Rust library for communicating with MOTU audio devices over USB"
+license = "MIT"
+
+[dependencies]
+nusb = "0.1"
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+thiserror = "2"
+tracing = "0.1"
+rand = "0.9"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[[example]]
+name = "get_datastore"
+path = "examples/get_datastore.rs"

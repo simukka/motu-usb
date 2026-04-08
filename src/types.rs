@@ -147,10 +147,90 @@ pub const MOTU_MAGIC: &[u8; 4] = b"UTOM";
 /// Inner header constant (always 8).
 pub const INNER_HDR_VALUE: u32 = 8;
 
+/// Maximum `payload_len` wire field value for a non-terminal NREK chunk.
+///
+/// Confirmed from Ghidra `ControllerHostCommandHost::Send` (ControllerHostCommandHost.cpp):
+///   `assert("cmd->fLength <= 4072", ...)` where `fLength` is the `payload_len` wire field.
+///
+/// Device sends continuation chunks with `payload_len == 4072` exactly.
+/// The last chunk (and single-chunk responses) have `payload_len < 4072`.
+/// Since `payload_len = actual_payload_bytes + 8`, continuation chunks carry
+/// 4064 bytes of actual payload each.
+pub const NREK_CHUNK_MAX: u16 = 0xfe8; // 4072
+
+/// Authentication header name required in PTTH (one-shot HTTP) requests.
+///
+/// NREK (long-poll GET /datastore) does NOT include this header — confirmed
+/// from usbmon capture of the Windows driver.
+pub const AUTH_HEADER: &str = "Unsecure-Auth-MOTU";
+
+/// Authentication token paired with `AUTH_HEADER`.
+pub const AUTH_TOKEN: &str = "unicorn666";
+
+/// Identity and capability information for a connected MOTU device.
+///
+/// Collected during [`crate::MotuDevice::connect_via`] by querying the
+/// device datastore.  Use this to identify which physical device a
+/// [`crate::MotuDevice`] represents when multiple MOTU devices are
+/// connected to the same computer.
+///
+/// # Example
+///
+/// ```no_run
+/// # use motu_usb::MotuDevice;
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let device = MotuDevice::connect().await.unwrap();
+/// let info = &device.info;
+/// println!("{} {} (fw {}, eui {})", info.model_name, info.host_type,
+///          info.firmware_version, info.avb_eui);
+/// # });
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct DeviceInfo {
+    /// AVB entity unique identifier (EUI-64), e.g. `"0001f2fffe00a4df"`.
+    ///
+    /// Derived from the device's MAC address; uniquely identifies the
+    /// physical hardware across sessions and connection types.
+    /// From `GET /datastore/avb/devs`.
+    pub avb_eui: String,
+
+    /// Human-readable device name, e.g. `"828ES"`.
+    /// From `GET /datastore/avb/<eui>/entity_name`.
+    pub entity_name: String,
+
+    /// Device model name, e.g. `"828ES"`.
+    /// From `GET /datastore/avb/<eui>/model_name`.
+    pub model_name: String,
+
+    /// Firmware version string, e.g. `"1.3.4+172\n07/27/18 17:15:10"`.
+    /// From `GET /datastore/avb/<eui>/firmware_version`.
+    pub firmware_version: String,
+
+    /// Connection type reported by the device: `"USB"` or `"Ethernet"`.
+    /// From `GET /datastore/host_type`.
+    pub host_type: String,
+}
+
+impl std::fmt::Display for DeviceInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} [{}] fw={} eui={}",
+            self.model_name,
+            self.host_type,
+            self.firmware_version.lines().next().unwrap_or("?"),
+            self.avb_eui,
+        )
+    }
+}
+
 /// Decoded frame from the device.
 #[derive(Debug, Clone)]
 pub enum Frame {
-    /// PONG response (echoes the host's seq).
+    /// PONG response (8 bytes, flags=0x00, total_len=8).
+    ///
+    /// The device echoes the host's seq byte. Device seq for data frames is
+    /// its own 6-bit counter | 0x40; for PONG it copies the sender's seq.
     Pong { echoed_seq: u8 },
     /// Data frame with decoded inner header.
     Data {
@@ -159,6 +239,13 @@ pub enum Frame {
         session_id: u32,
         msg_seq: u32,
         chunk_idx: u16,
+        /// Wire field `payload_len` at bytes [22:24].
+        ///
+        /// Equals `actual_payload_bytes + 8` (the +8 accounts for the UTOM magic
+        /// and `inner_hdr` constant that precede the payload in the protocol buffer).
+        /// Compare against `NREK_CHUNK_MAX` (4072) to detect the last NREK chunk:
+        /// `payload_len < NREK_CHUNK_MAX` → this is the final (or only) chunk.
+        payload_len: u16,
         payload: Vec<u8>,
     },
 }

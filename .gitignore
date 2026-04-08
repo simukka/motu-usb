@@ -1,6 +1,5 @@
 *.jsonl
 .venv
-*.txt
 
 # Added by cargo
 

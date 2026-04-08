@@ -1,14 +1,32 @@
+
 #!/usr/bin/env python3
 """
 usbmon-capture.py — Capture USB bulk traffic on MOTU vendor interfaces via usbmon.
 
-Use this if bulk-probe.py gets no response. Run this on Linux while you access
-the MOTU web UI from the Windows VM. Filters bulk transfers on the vendor
-interfaces (EP3 IN / EP4 OUT) and decodes them as ASCII/HTTP where possible.
+Run on Linux while the Windows VM (or windows-driver-session.py) accesses the
+device.  Saves a timestamped JSONL of all bulk packets on EP3 IN / EP4 OUT.
 
 Uses the usbmon TEXT format from debugfs (/sys/kernel/debug/usb/usbmon/<bus>u),
-which is always available when the usbmon module is loaded. No /dev/usbmon*
-device nodes are required.
+which is always available when the usbmon module is loaded.  For full payloads
+(not capped at 32 bytes) the binary /dev/usbmon<N> interface is preferred and
+used automatically when available.
+
+Capture workflow for Windows VM session:
+  1.  sudo modprobe usbmon
+  2.  Plug 828ES into Linux host (not yet passed to VM)
+  3.  sudo python3 scripts/usbmon-capture.py --save captures/windows-$(date +%s).jsonl
+  4.  Pass USB device to Windows VM (QEMU hostdev / VirtualBox)
+  5.  Open MOTU Control software in Windows
+  6.  Perform all target actions:
+        - Let it connect (CONNECT + POST /host/os + initial NREK)
+        - Change clock source
+        - Change sample rate
+        - Move a mixer fader
+        - Change a routing entry
+        - Toggle mute
+        - Open/close MOTU Control UI
+  7.  Press Ctrl+C → JSONL is written
+  8.  python3 scripts/analyze-capture.py <file>.jsonl   # decode frames
 
 Text format reference: https://www.kernel.org/doc/html/latest/usb/usbmon.html
 Each line:
@@ -18,11 +36,9 @@ Each line:
 
 Requires: Linux kernel usbmon module
 Run as root: sudo python3 scripts/usbmon-capture.py
-
-Then in the Windows VM: open http://motu/ or the MOTU Control software.
-Press Ctrl+C to stop.
 """
 
+import argparse
 import json
 import operator
 import os
@@ -55,7 +71,7 @@ def hdr(m):
 # ─── usbmon text-format line parser ──────────────────────────────────────────
 # Example: "ffff88020b6b5380 3575914555 S Bo:7:009:4 -115 31 = 47455420 2f646174"
 _LINE_RE = re.compile(
-    r"^[0-9a-f]+ \d+ [SCE] "
+    r"^[0-9a-f]+ (\d+) [SCE] "
     r"([BCISi])([io]):"
     r"(\d+):(\d+):(\d+)"
     r" -?\d+ (\d+)"
@@ -67,7 +83,7 @@ def parse_line(line: str) -> dict | None:
     m = _LINE_RE.match(line.strip())
     if not m:
         return None
-    xfer_type, direction, bus, dev, ep, length, hex_data = m.groups()
+    ts_us, xfer_type, direction, bus, dev, ep, length, hex_data = m.groups()
     if xfer_type != "B":
         return None
     ep = int(ep)
@@ -75,6 +91,7 @@ def parse_line(line: str) -> dict | None:
         return None
     data = bytes.fromhex(hex_data.replace(" ", "")) if hex_data else b""
     return {
+        "ts":        int(ts_us) / 1_000_000.0,  # usbmon timestamp in seconds
         "direction": "IN" if direction == "i" else "OUT",
         "bus": int(bus),
         "dev": int(dev),
@@ -279,7 +296,9 @@ try:
 
                 data = bytes(databuf[:pkt_hdr.len_cap])
                 direction = "IN" if (pkt_hdr.epnum & 0x80) else "OUT"
+                ts = pkt_hdr.ts_sec + pkt_hdr.ts_usec / 1_000_000.0
                 p = {
+                    "ts":        ts,
                     "direction": direction,
                     "bus":       pkt_hdr.busnum,
                     "dev":       pkt_hdr.devnum,
@@ -413,17 +432,86 @@ def analyse(packets: list[dict]) -> None:
                 print(f"   {sample[:64].hex()}")
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Capture USB bulk traffic on MOTU vendor interfaces via usbmon.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  sudo python3 usbmon-capture.py                           # auto-detect\n"
+            "  sudo python3 usbmon-capture.py --device 7:9             # bus 7 dev 9\n"
+            "  sudo python3 usbmon-capture.py --save captures/run.jsonl # custom path\n"
+            "  python3 usbmon-capture.py --wireshark --device 7:9      # Wireshark cmd"
+        ),
+    )
+    parser.add_argument(
+        "--device", "-d",
+        metavar="BUS:DEV",
+        help=(
+            "Manually specify the USB bus and device numbers to capture, e.g. '7:9'. "
+            "Skips auto-detection via sysfs. Use 'lsusb' to find your device."
+        ),
+    )
+    parser.add_argument(
+        "--save", "-s",
+        metavar="FILE",
+        help=(
+            "Path to write the JSONL capture file. "
+            "Defaults to captures/usbmon-<timestamp>.jsonl"
+        ),
+    )
+    parser.add_argument(
+        "--wireshark", "-w",
+        action="store_true",
+        help=(
+            "Print the Wireshark command to capture traffic for the selected bus/device "
+            "and exit without starting a capture."
+        ),
+    )
+    return parser.parse_args()
+
+
+def _wireshark_command(bus: int, dev: int) -> str:
+    return (
+        f"sudo wireshark -k -i usbmon{bus} "
+        f"-Y \"usb.device_address == {dev}\""
+    )
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main() -> None:
+    args = _parse_args()
     hdr("MOTU usbmon Bulk Traffic Capture")
 
-    devices = find_motu_devices()
-    if not devices:
-        err("No MOTU devices found in sysfs.")
-        sys.exit(1)
+    # ── Resolve bus / device ──────────────────────────────────────────────────
+    if args.device:
+        # Manual override: parse BUS:DEV
+        try:
+            bus_str, dev_str = args.device.split(":")
+            bus = int(bus_str)
+            forced_dev = int(dev_str)
+        except ValueError:
+            err(f"Invalid --device value '{args.device}'. Expected format: BUS:DEV (e.g. 7:9).")
+            sys.exit(1)
+        devices = [{"name": f"USB device {bus}:{forced_dev}", "bus": bus, "dev": forced_dev}]
+        motu_devnums = {forced_dev}
+        info(f"Using manually specified device  bus={bus} dev={forced_dev}")
+    else:
+        devices = find_motu_devices()
+        if not devices:
+            err("No MOTU devices found in sysfs.")
+            sys.exit(1)
+        bus = devices[0]["bus"]
+        motu_devnums = {d["dev"] for d in devices}
 
-    bus = devices[0]["bus"]
-    motu_devnums = {d["dev"] for d in devices}
+    # ── Print Wireshark command hint ──────────────────────────────────────────
+    for d in devices:
+        cmd = _wireshark_command(d["bus"], d["dev"])
+        info(f"Wireshark command for {d['name']} (bus={d['bus']} dev={d['dev']}):")
+        print(f"  {BLD}{cmd}{RST}", flush=True)
+
+    if args.wireshark:
+        sys.exit(0)
 
     mon_path, mode = ensure_usbmon(bus)
 
@@ -439,13 +527,23 @@ def main() -> None:
     print()
     ok(f"Captured {total} bulk packets total across {len(devices)} device(s)")
 
+    ts_tag = time.strftime("%Y%m%d-%H%M%S")
+
     for devnum, pkts in packets_by_dev.items():
         name = dev_info.get(devnum, {}).get("name", f"dev{devnum}")
         safe_name = name.replace(" ", "_")
         ok(f"{name} (dev {devnum}): {len(pkts)} packets")
 
         if pkts:
-            out_path = Path(f"scripts/usbmon-bus{bus}-dev{devnum}-{safe_name}-packets.jsonl")
+            # Resolve output path: --save > default timestamped name
+            if args.save:
+                out_path = Path(args.save)
+            else:
+                out_path = Path(
+                    f"captures/usbmon-{ts_tag}"
+                    f"-bus{bus}-dev{devnum}-{safe_name}.jsonl"
+                )
+            out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(
                 "\n".join(
                     json.dumps({k: v for k, v in p.items() if k != "data"})

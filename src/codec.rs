@@ -5,7 +5,7 @@
 //! decoding responses in that format.
 
 use crate::error::{MotuError, Result};
-use crate::types::{Request, Response};
+use crate::types::{Method, Request, Response};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -161,10 +161,167 @@ pub fn decode_response(payload: &[u8]) -> Result<Response> {
     })
 }
 
+// ─── MOTU POST body envelope ────────────────────────────────────────────────
+
+/// Encode a MOTU binary POST body.
+///
+/// All datastore POSTs use a binary KV envelope around the JSON value,
+/// as observed in the Windows driver capture:
+///
+/// ```text
+/// u32 remaining_len   (= 4 + key.len() + 4 + value.len())
+/// u32 key_len + key   ("json")
+/// u32 val_len + val   (e.g. {"value": "win"})
+/// ```
+///
+/// Sending the raw JSON bytes without this wrapper causes `MOTUAVBController`
+/// to misread the first 4 bytes as a huge allocation size → `std::bad_alloc`.
+pub fn encode_motu_post_body(key: &[u8], value: &[u8]) -> Vec<u8> {
+    // remaining_len covers everything after the first u32
+    let remaining = 4usize + key.len() + 4 + value.len();
+    let mut body = Vec::with_capacity(4 + remaining);
+    write_u32(&mut body, remaining as u32);
+    write_u32(&mut body, key.len() as u32);
+    body.extend_from_slice(key);
+    write_u32(&mut body, value.len() as u32);
+    body.extend_from_slice(value);
+    body
+}
+
+/// Decode a MOTU binary POST body, returning the value bytes.
+///
+/// Inverse of [`encode_motu_post_body`]. Used by the device simulator to
+/// extract the JSON payload from an incoming POST request.
+pub fn decode_motu_post_body(body: &[u8]) -> Result<Vec<u8>> {
+    if body.len() < 12 {
+        return Err(MotuError::Codec(format!(
+            "MOTU POST body too short: {} bytes (need ≥12)",
+            body.len()
+        )));
+    }
+    // Skip u32 remaining_len, read the key length, then skip the key.
+    let key_len = read_u32(body, 4)? as usize;
+    let val_len_offset = 8 + key_len;
+    if val_len_offset + 4 > body.len() {
+        return Err(MotuError::Codec(
+            "MOTU POST body: key overflows data".to_string(),
+        ));
+    }
+    let val_len = read_u32(body, val_len_offset)? as usize;
+    let val_start = val_len_offset + 4;
+    if val_start + val_len > body.len() {
+        return Err(MotuError::Codec(
+            "MOTU POST body: value overflows data".to_string(),
+        ));
+    }
+    Ok(body[val_start..val_start + val_len].to_vec())
+}
+
+// ─── Server-side codec (used by DeviceSimulator) ────────────────────────────
+
+/// Decode a binary-encoded HTTP request sent by the host.
+///
+/// Inverse of [`encode_request`]. Used by the device simulator to parse
+/// incoming frames from the host.
+///
+/// Layout:
+/// ```text
+/// u32 version=1 | u32 flags=0 | u32 N (inner section size, excludes body)
+/// u32 method_len + method | u32 path_len + path
+/// u32 num_headers [u32 name_len + name + u32 val_len + val] × n
+/// u32 num_params  [u32 name_len + name + u32 val_len + val] × n
+/// [body at offset 12+N]
+/// ```
+pub fn decode_request(payload: &[u8]) -> Result<Request> {
+    if payload.len() < 12 {
+        return Err(MotuError::Codec(format!(
+            "request payload too short: {} bytes (need ≥12)",
+            payload.len()
+        )));
+    }
+
+    let _version = read_u32(payload, 0)?;
+    let _flags = read_u32(payload, 4)?;
+    let n = read_u32(payload, 8)? as usize;
+
+    let mut offset = 12;
+    let method_str = read_length_prefixed_str(payload, &mut offset)?;
+    let path = read_length_prefixed_str(payload, &mut offset)?;
+
+    let num_headers = read_u32(payload, offset)? as usize;
+    offset += 4;
+    let mut headers = Vec::with_capacity(num_headers);
+    for _ in 0..num_headers {
+        let name = read_length_prefixed_str(payload, &mut offset)?;
+        let value = read_length_prefixed_str(payload, &mut offset)?;
+        headers.push((name, value));
+    }
+
+    let num_params = read_u32(payload, offset)? as usize;
+    offset += 4;
+    let mut params = Vec::with_capacity(num_params);
+    for _ in 0..num_params {
+        let name = read_length_prefixed_str(payload, &mut offset)?;
+        let value = read_length_prefixed_str(payload, &mut offset)?;
+        params.push((name, value));
+    }
+
+    let body_start = 12 + n;
+    let body = if body_start < payload.len() {
+        payload[body_start..].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    let method = match method_str.as_str() {
+        "GET" => Method::Get,
+        "POST" => Method::Post,
+        "PATCH" => Method::Patch,
+        "DELETE" => Method::Delete,
+        "PUT" => Method::Put,
+        other => {
+            return Err(MotuError::Codec(format!("unknown HTTP method: {other:?}")));
+        }
+    };
+
+    Ok(Request { method, path, headers, params, body })
+}
+
+/// Encode an HTTP response into the MOTU binary format.
+///
+/// Inverse of [`decode_response`]. Used by the device simulator to send
+/// responses back to the host.
+///
+/// Layout:
+/// ```text
+/// u32 version=1 | u32 flags=0 | u32 N (status+headers section size ONLY)
+/// u32 status_code | u32 num_headers
+/// [u32 name_len + name + u32 val_len + val] × num_headers
+/// [body bytes starting at offset 12+N]
+/// ```
+pub fn encode_response(resp: &Response) -> Vec<u8> {
+    // Build the status + headers inner section.
+    let mut inner = Vec::new();
+    write_u32(&mut inner, resp.status);
+    write_u32(&mut inner, resp.headers.len() as u32);
+    for (name, val) in &resp.headers {
+        write_length_prefixed_str(&mut inner, name);
+        write_length_prefixed_str(&mut inner, val);
+    }
+    let n = inner.len() as u32;
+
+    let mut payload = Vec::with_capacity(12 + inner.len() + resp.body.len());
+    write_u32(&mut payload, 1);  // version
+    write_u32(&mut payload, 0);  // flags
+    write_u32(&mut payload, n);  // N = size of inner section
+    payload.extend_from_slice(&inner);
+    payload.extend_from_slice(&resp.body);
+    payload
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Method;
 
     #[test]
     fn test_encode_post_request() {

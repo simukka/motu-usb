@@ -2,7 +2,7 @@
 
 use crate::error::{MotuError, Result};
 use nusb::transfer::RequestBuffer;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 /// MOTU USB vendor ID.
 pub const MOTU_VID: u16 = 0x07FD;
@@ -52,6 +52,7 @@ impl MotuUsb {
     /// Write data to the bulk OUT endpoint.
     pub async fn write(&self, data: &[u8]) -> Result<()> {
         debug!("USB write: {} bytes", data.len());
+        trace!("USB write data: {:02x?}", data);
         let completion = self.interface.bulk_out(EP_BULK_OUT, data.to_vec()).await;
         completion.status?;
         Ok(())
@@ -69,6 +70,7 @@ impl MotuUsb {
         completion.status?;
         let data = completion.data;
         debug!("USB read: {} bytes", data.len());
+        trace!("USB read data: {:02x?}", data);
         Ok(data.to_vec())
     }
 

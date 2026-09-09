@@ -31,6 +31,14 @@ Protocol summary (from usbmon capture + HAR reverse engineering):
   │  [28-31] inner_hdr   u32  — always 8                             │
   │  [32…]   payload          — binary-serialized HTTP (see codec)   │
   └──────────────────────────────────────────────────────────────────┘
+  Initialisation sequence (must be followed exactly):
+    1. CONNECT  (flags=0x82) — session open
+    2. PTTH POST /datastore/host/os  {"value": "linux"}
+          header: Unsecure-Auth-MOTU: unicorn666
+       The device acknowledges every frame with a 28-byte data-ACK (DACK)
+       but will NOT send actual responses until after this POST is received.
+    3. PING loop + NREK long-poll loop (background threads)
+
   Large IN responses (e.g. initial /datastore dump ≥ 4 KiB) are delivered
   as a single USB bulk transfer spanning multiple 512-byte USB packets.
   The outer+inner header appears only in the FIRST packet; subsequent packets
@@ -188,7 +196,22 @@ def decode_response(data: bytes) -> "tuple[int, list[tuple[str,str]], bytes]":
 
 # ─── Frame parser ─────────────────────────────────────────────────────────────
 class ParsedFrame:
-    __slots__ = ("seq", "flags", "total_len", "is_ack", "is_connect",
+    """
+    Parses one IN transfer from the device.
+
+    Three sub-types beyond CONNECT and transport ACK:
+
+      data-ACK (28 bytes):
+        outer(4) + short-inner(20) + footer(4) = 28
+        short-inner ends at payload_len; motu_magic and inner_hdr are absent.
+        The device sends one of these immediately for every OUT data frame to
+        acknowledge receipt.  payload_len == 0; do NOT deliver to callers.
+
+      full data frame (>= 36 bytes):
+        outer(4) + full-inner(28) + payload + footer(4)
+        motu_magic is present at [24:28].  This carries the actual response.
+    """
+    __slots__ = ("seq", "flags", "total_len", "is_ack", "is_connect", "is_data_ack",
                  "msg_type", "session_id", "msg_seq", "chunk_idx",
                  "payload_len", "payload")
 
@@ -202,35 +225,48 @@ class ParsedFrame:
         # CONNECT: 4-byte session-open packet (flags=0x82)
         if usb_len == 4 and self.flags == 0x82:
             self.is_connect = True
-            self.is_ack = False
+            self.is_ack = self.is_data_ack = False
             self.msg_type = self.session_id = self.msg_seq = None
             self.chunk_idx = self.payload_len = self.payload = None
             return
 
         self.is_connect = False
 
-        # 8-byte ACK echoes the OUT seq
+        # 8-byte transport ACK echoes the OUT seq
         if usb_len == 8 and self.flags == 0x00:
             self.is_ack = True
+            self.is_data_ack = False
             self.msg_type = self.session_id = self.msg_seq = None
             self.chunk_idx = self.payload_len = self.payload = None
             return
 
         self.is_ack = False
-        if len(raw) < 32:
-            raise ValueError(f"Data frame too short for inner header: {len(raw)}")
+        # Need at least the 20 bytes of the short inner header (through payload_len)
+        if len(raw) < 24:
+            raise ValueError(f"Data frame too short: {len(raw)} bytes")
+
         self.msg_type    = raw[4:8]
         self.session_id  = struct.unpack_from("<I", raw, 8)[0]
         self.msg_seq     = struct.unpack_from("<I", raw, 12)[0]
-        self.chunk_idx   = struct.unpack_from("<H", raw, 20)[0]  # 0=OUT or first; increments for large IN chunks
+        self.chunk_idx   = struct.unpack_from("<H", raw, 20)[0]
         self.payload_len = struct.unpack_from("<H", raw, 22)[0]
-        # Device IN responses carry a 4-byte footer (outer header copy) at total_len-4.
-        # Payload is raw[32 … total_len-4]; OUT frames have no footer.
-        if raw[1] == 0x00 and self.total_len >= 36:
-            end = min(self.total_len - 4, len(raw))
-            self.payload = raw[32:end] if end > 32 else b""
+
+        # Distinguish frame types by checking for MOTU_MAGIC at bytes [24:28].
+        # Data-ACK (28 bytes): footer sits at [24:28], no MOTU_MAGIC, payload_len=0.
+        # Full data frame (>=36 bytes): MOTU_MAGIC at [24:28], payload at [32:].
+        has_magic = (len(raw) >= 28 and raw[24:28] == MOTU_MAGIC)
+        self.is_data_ack = not has_magic
+
+        if has_magic:
+            # Full frame: device IN has a 4-byte footer at total_len-4
+            if self.flags == 0x00 and self.total_len >= 36:
+                end = min(self.total_len - 4, len(raw))
+                self.payload = raw[32:end] if end > 32 else b""
+            else:
+                self.payload = raw[32:] if len(raw) > 32 else b""
         else:
-            self.payload = raw[32:] if len(raw) > 32 else b""
+            # Data-ACK: no payload
+            self.payload = b""
 
     def __repr__(self) -> str:
         if self.is_connect:
@@ -238,8 +274,9 @@ class ParsedFrame:
         if self.is_ack:
             return f"<ACK seq=0x{self.seq:02x}>"
         t = self.msg_type.decode("ascii", errors="?") if self.msg_type else "?"
-        chunk = f" chunk={self.chunk_idx}" if self.chunk_idx else ""
-        return (f"<{t} seq=0x{self.seq:02x} msg_seq={self.msg_seq}{chunk} "
+        if self.is_data_ack:
+            return f"<{t}-DACK seq=0x{self.seq:02x} msg_seq={self.msg_seq}>"
+        return (f"<{t} seq=0x{self.seq:02x} msg_seq={self.msg_seq} "
                 f"payload_len={self.payload_len}>")
 
 
@@ -297,11 +334,18 @@ class MotuDevice:
         """Claim the USB interface and start background threads."""
         self._claim_interface()
         self._reader.start()
-        # Send CONNECT (flags=0x82) as the very first OUT packet — the device
-        # expects this before any PING or data frames.
+        # CONNECT (flags=0x82): first OUT packet; device expects it before any data.
+        # Use _write() so its 8-byte transport ACK is properly consumed.
         seq = self._next_seq()
-        self._dev.write(EP_BULK_OUT, make_connect(seq), USB_TIMEOUT_MS)
+        self._write(seq, make_connect(seq))
         logger.debug("[%s] CONNECT seq=0x%02x", self.serial, seq)
+        
+        # Verify: 
+        # Host registration: without this the device accepts frames (sends DACKs)
+        # but never sends actual responses.  The Windows driver always sends this
+        # POST before starting the long-poll.
+        # self._init_session()
+        
         self._pinger.start()
         if self._enable_nrek:
             self._nreker.start()
@@ -340,6 +384,8 @@ class MotuDevice:
             self._write(seq, frame)
             logger.debug("[%s] PTTH OUT seq=0x%02x msg_seq=%d payload=%d bytes",
                          self.serial, seq, msg_seq, len(payload))
+            
+
             resp_payload = resp_q.get(timeout=timeout)
             return decode_response(resp_payload)
         except queue.Empty as exc:
@@ -351,6 +397,32 @@ class MotuDevice:
                 self._ptth_pending.pop(msg_seq, None)
 
     # ── Internal helpers ───────────────────────────────────────────────────────
+
+    def _init_session(self) -> None:
+        """
+        Register the host with the device via POST /datastore/host/os.
+
+        Q: Does the Windows driver always sends this before starting the NREK long-poll?
+        Without it the device acknowledges every frame (sends DACKs) but stays
+        silent — no NREK or PTTH response ever arrives.
+        """
+        logger.debug("[%s] Host registration → POST /datastore/host/os", self.serial)
+        try:
+            status, hdrs, body = self.send_ptth(
+                "POST", "/datastore/host/os",
+                [("Unsecure-Auth-MOTU", "unicorn666"),
+                 ("Content-Type", "application/json")],
+                [],
+                b'{"value": "linux"}',
+                timeout=10.0,
+            )
+            logger.info("[%s] Host registered: HTTP %d  body=%r",
+                        self.serial, status, body[:120])
+        except TimeoutError as exc:
+            logger.warning("[%s] Host registration timed out — "
+                           "device may not respond to requests: %s", self.serial, exc)
+        except Exception as exc:
+            logger.warning("[%s] Host registration failed: %s", self.serial, exc)
 
     def _claim_interface(self) -> None:
         cfg = self._dev.get_active_configuration()
@@ -377,6 +449,9 @@ class MotuDevice:
 
     def _write(self, seq: int, data: bytes) -> None:
         ack_q: queue.Queue = queue.Queue()
+        if self._verbose:
+            logger.debug("[%s] OUT seq=0x%02x  %d bytes  hex=%s",
+                         self.serial, seq, len(data), data[:32].hex())
         # Register the ACK queue BEFORE writing, so the reader can't miss it
         with self._ack_lock:
             self._ack_queues[seq] = ack_q
@@ -384,8 +459,9 @@ class MotuDevice:
             self._dev.write(EP_BULK_OUT, data, USB_TIMEOUT_MS)
             try:
                 ack_q.get(timeout=2.0)
+                logger.debug("[%s] ACK  seq=0x%02x", self.serial, seq)
             except queue.Empty:
-                logger.debug("[%s] No ACK for seq=0x%02x", self.serial, seq)
+                logger.warning("[%s] No ACK for seq=0x%02x (2 s timeout)", self.serial, seq)
         finally:
             with self._ack_lock:
                 self._ack_queues.pop(seq, None)
@@ -403,12 +479,21 @@ class MotuDevice:
                 break
 
             if len(raw) < 4:
+                logger.debug("[%s] IN  tiny packet (%d bytes): %s",
+                             self.serial, len(raw), raw.hex())
                 continue
+
+            if self._verbose:
+                preview = raw[:32].hex()
+                logger.debug("[%s] IN  %d bytes  hex[0:32]=%s",
+                             self.serial, len(raw), preview)
 
             try:
                 frame = ParsedFrame(raw, len(raw))
             except ValueError as exc:
-                logger.debug("[%s] Parse error: %s", self.serial, exc)
+                logger.debug("[%s] Parse error: %s\n"
+                             "         hex[0:32]=%s",
+                             self.serial, exc, raw[:32].hex())
                 continue
 
             if self._verbose:
@@ -424,29 +509,50 @@ class MotuDevice:
                     q = self._ack_queues.get(frame.seq)
                 if q:
                     q.put(frame.seq)
+                else:
+                    logger.debug("[%s] ACK seq=0x%02x has no waiter (pending: %s)",
+                                 self.serial, frame.seq,
+                                 [f"0x{s:02x}" for s in self._ack_queues])
 
             elif frame.msg_type == b"PTTH":
-                with self._ptth_lock:
-                    q = self._ptth_pending.get(frame.msg_seq)
-                if q:
-                    q.put(frame.payload)
+                if frame.is_data_ack:
+                    logger.debug("[%s] PTTH-DACK msg_seq=%d (device acknowledged request, awaiting response)",
+                                 self.serial, frame.msg_seq)
                 else:
-                    logger.warning("[%s] Unexpected PTTH IN msg_seq=%d",
-                                   self.serial, frame.msg_seq)
+                    with self._ptth_lock:
+                        q = self._ptth_pending.get(frame.msg_seq)
+                    if q:
+                        logger.debug("[%s] PTTH IN  msg_seq=%d  payload=%d bytes",
+                                     self.serial, frame.msg_seq,
+                                     len(frame.payload) if frame.payload else 0)
+                        q.put(frame.payload)
+                    else:
+                        logger.warning("[%s] Unexpected PTTH IN msg_seq=%d  "
+                                       "pending msg_seqs=%s",
+                                       self.serial, frame.msg_seq,
+                                       sorted(self._ptth_pending))
 
             elif frame.msg_type == b"NREK":
-                # libusb already returned the complete transfer in one read() call.
-                # Just deliver the payload directly to the waiting queue.
-                with self._nrek_lock:
-                    q = self._nrek_pending.get(frame.msg_seq)
-                if q:
-                    q.put(frame.payload)
-                else:
-                    logger.debug("[%s] NREK IN msg_seq=%d (unmatched)",
+                if frame.is_data_ack:
+                    logger.debug("[%s] NREK-DACK msg_seq=%d (long-poll accepted by device)",
                                  self.serial, frame.msg_seq)
+                else:
+                    # libusb already returned the complete transfer in one read() call.
+                    with self._nrek_lock:
+                        q = self._nrek_pending.get(frame.msg_seq)
+                    if q:
+                        logger.debug("[%s] NREK IN  msg_seq=%d  payload=%d bytes",
+                                     self.serial, frame.msg_seq,
+                                     len(frame.payload) if frame.payload else 0)
+                        q.put(frame.payload)
+                    else:
+                        logger.debug("[%s] NREK IN  msg_seq=%d (no waiter; pending=%s)",
+                                     self.serial, frame.msg_seq,
+                                     sorted(self._nrek_pending))
 
             else:
-                logger.debug("[%s] Unknown msg_type=%r", self.serial, frame.msg_type)
+                logger.debug("[%s] Unknown msg_type=%r  seq=0x%02x  hex[0:32]=%s",
+                             self.serial, frame.msg_type, frame.seq, raw[:32].hex())
 
     def _ping_loop(self) -> None:
         logger.debug("[%s] Pinger thread started", self.serial)
@@ -492,18 +598,22 @@ class MotuDevice:
                 status, resp_headers, body = decode_response(resp_payload)
 
                 if status == 200:
-                    for k, v in resp_headers:
-                        if k.lower() == "etag":
-                            self._nrek_etag = v
-                            logger.info("[%s] NREK: datastore changed, new ETag=%s",
-                                        self.serial, v)
-                            break
+                    etag = next((v for k, v in resp_headers if k.lower() == "etag"), None)
+                    if etag:
+                        self._nrek_etag = etag
+                        logger.info("[%s] NREK 200  new ETag=%s  body=%d bytes",
+                                    self.serial, etag, len(body))
+                    else:
+                        logger.info("[%s] NREK 200  no ETag in response  body=%d bytes",
+                                    self.serial, len(body))
                 else:
-                    logger.debug("[%s] NREK: %d (no change)", self.serial, status)
+                    logger.debug("[%s] NREK %d (no change)", self.serial, status)
 
             except queue.Empty:
-                logger.debug("[%s] NREK: no response within %gs",
-                             self.serial, NREK_TIMEOUT_S)
+                with self._nrek_lock:
+                    pending = sorted(self._nrek_pending)
+                logger.debug("[%s] NREK timeout after %gs  pending msg_seqs=%s",
+                             self.serial, NREK_TIMEOUT_S, pending)
             except Exception as exc:
                 if not self._stop.is_set():
                     logger.warning("[%s] NREK error: %s", self.serial, exc)

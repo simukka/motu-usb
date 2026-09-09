@@ -1,0 +1,30 @@
+[package]
+name = "motu-usb"
+version = "0.1.0"
+edition = "2024"
+description = "Async Rust library for communicating with MOTU audio devices over USB"
+license = "MIT"
+
+[dependencies]
+nusb = "0.1"
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "get_datastore"
+path = "examples/get_datastore.rs"
+
+[[example]]
+name = "start_telnet"
+path = "examples/start_telnet.rs"
+
+[[example]]
+name = "connect"
+path = "examples/connect.rs"

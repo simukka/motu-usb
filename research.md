@@ -346,3 +346,254 @@ are actually a single logical transfer — one outer+inner header in the first 5
 raw body continuation in subsequent URBs with no repeated headers.
 
 The read(EP_BULK_IN, 65536) via libusb operates at the transfer level and should receive complete frames.
+
+# Wireshark USB Capture Guide
+
+## Goal
+
+The existing `capture-windows-boot.jsonl` was captured via usbmon's text interface, which truncates payloads to 32 bytes. We need full-payload captures to resolve the protocol gaps listed below.
+
+## Protocol Gaps to Investigate
+
+Each capture scenario below targets specific unknowns. When analysing, look for:
+
+1. **Session ID lifecycle** — Is `session_id` random per-frame or stable per-session? Do IN responses echo the OUT request's session_id?
+2. **CONNECT handshake details** — Does the device send anything beyond the 8-byte PONG after CONNECT? (capabilities, version, etc.)
+3. **Chunked response mechanics** — What triggers chunk boundaries? Is it always 4096 bytes? Does `chunk_idx` increment? Must the host PING between every chunk?
+4. **IN frame footer** — Is the 4-byte footer (outer header copy) present on ALL IN data frames, including small ones?
+5. **Error responses** — What does the device send for invalid paths or malformed requests? Binary-encoded HTTP 4xx/5xx, or a protocol-level error frame?
+6. **Sequence number strictness** — Does the device validate OUT seq numbers? Can we start at any value?
+7. **NREK vs PTTH concurrency** — Can both channels be active simultaneously? Are session_ids and msg_seqs truly independent?
+8. **Long-poll termination** — How does the NREK long-poll return? Binary-encoded 304 status, or something else?
+9. **Payload_len field** — Does it always equal `total_len - 32`? Does it differ for continuation chunks?
+10. **Device-initiated messages** — Can the device push data without a preceding request?
+
+## Setup: Full-Payload Capture with tcpdump
+
+### Prerequisites
+
+```bash
+# Load the usbmon kernel module
+sudo modprobe usbmon
+
+# Find the MOTU device bus number
+lsusb | grep 07fd
+# Example output: Bus 007 Device 011: ID 07fd:0005 Mark of the Unicorn
+# The bus number here is 7
+```
+
+### Option A: tcpdump (recommended — simplest, produces pcap for Wireshark)
+
+```bash
+# Replace usbmon7 with your bus number from lsusb
+sudo tcpdump -i usbmon7 -w captures/motu-$(date +%Y%m%d-%H%M%S).pcap -s 0
+
+# -s 0 = capture full packets (no truncation)
+# Press Ctrl+C to stop
+```
+
+Open the resulting .pcap in Wireshark. Filter to bulk transfers on the MOTU endpoints:
+```
+usb.endpoint_address == 0x04 || usb.endpoint_address == 0x83
+```
+
+### Option B: usbmon-capture.py with binary mode
+
+The script already supports `/dev/usbmon<N>` binary capture (full payloads). If `/dev/usbmon<N>` doesn't exist:
+
+```bash
+# Find the major number and create the device node
+MAJOR=$(grep usbmon /proc/devices | awk '{print $1}')
+BUS=7  # your bus number
+sudo mknod /dev/usbmon${BUS} c ${MAJOR} ${BUS}
+
+# Then run the capture script
+sudo python3 scripts/usbmon-capture.py
+```
+
+### Option C: Wireshark GUI directly
+
+If Wireshark is installed with USBPcap support, you can capture interactively:
+1. Open Wireshark
+2. Select `usbmon7` (or your bus) as the capture interface
+3. Start capture
+4. Interact with the device
+5. Stop capture and apply display filter: `usb.endpoint_address == 0x04 || usb.endpoint_address == 0x83`
+
+## Capture Scenarios
+
+Create a `captures/` directory and run each scenario as a separate capture file. On the host Linux machine, start `tcpdump` before each scenario, then perform the action in the Windows VM.
+
+```bash
+mkdir -p captures
+```
+
+### Scenario 1: Cold boot handshake
+
+**What to capture**: The very first communication when the MOTU driver connects to the device.
+
+**Procedure**:
+1. Start tcpdump: `sudo tcpdump -i usbmon7 -w captures/01-cold-boot.pcap -s 0`
+2. In the Windows VM, connect the MOTU 828ES USB (or restart the VM with the device attached)
+3. Wait for the MOTU driver to initialise (the device LCD may update)
+4. Wait 30 seconds after the driver settles
+5. Stop tcpdump
+
+**What to look for**:
+- CONNECT frame and PONG response — is there anything beyond the 8-byte PONG?
+- What are the first few OUT data frames? (driver likely sends POST /datastore/host/os, etc.)
+- Initial seq and msg_seq values — do they always start at the same numbers?
+- **Gap #2** (CONNECT details), **Gap #6** (sequence strictness)
+
+### Scenario 2: Full GET /datastore (multi-chunk response)
+
+**What to capture**: The initial datastore fetch which returns ~200 KB of JSON, delivered as multiple chunks.
+
+**Procedure**:
+1. Ensure the Windows VM is already connected to the MOTU device
+2. Start tcpdump: `sudo tcpdump -i usbmon7 -w captures/02-get-datastore.pcap -s 0`
+3. In the Windows VM, open Chrome and navigate to `http://localhost:1280/<serial>/datastore`
+4. Wait for the page to fully load
+5. Stop tcpdump
+
+**What to look for**:
+- The OUT NREK request frame — full payload to confirm our codec encoding
+- The multi-chunk IN response: count the chunks, measure their sizes
+- Does `chunk_idx` increment (0, 1, 2, …) on each IN frame?
+- Does the host send PING between each chunk? Is there always exactly one PING per chunk?
+- What is the exact chunk boundary size? 4096 bytes? 4068 bytes (4096 - 28 header)?
+- The final short chunk — confirm this signals end-of-transfer
+- The 4-byte footer on each IN data frame
+- `session_id` — same value on all IN chunks, or different?
+- **Gaps #1, #3, #4, #9**
+
+### Scenario 3: Long-poll cycle (NREK with ETag)
+
+**What to capture**: The NREK long-poll that the web UI uses to watch for datastore changes.
+
+**Procedure**:
+1. Start tcpdump: `sudo tcpdump -i usbmon7 -w captures/03-long-poll.pcap -s 0`
+2. Open the MOTU web UI in the Windows VM (`http://localhost:1280/<serial>/`)
+3. Wait 30-60 seconds without touching anything — the UI long-polls via NREK with `If-None-Match`
+4. Then change a setting (e.g., turn a knob, change sample rate) so the poll returns data
+5. Wait another 30 seconds
+6. Stop tcpdump
+
+**What to look for**:
+- The NREK OUT request: does it include `If-None-Match` header with an ETag value?
+- When nothing changes: does the device return a 304 response? What does 304 look like in the binary codec?
+- When something changes: does it return 200 with the new datastore JSON?
+- How long does the long-poll block before timing out on the device side?
+- **Gap #8** (long-poll termination)
+
+### Scenario 4: POST to change a setting
+
+**What to capture**: A setting change via POST to confirm our request encoding.
+
+**Procedure**:
+1. Start tcpdump: `sudo tcpdump -i usbmon7 -w captures/04-post-setting.pcap -s 0`
+2. In the MOTU web UI, change a simple setting:
+   - Change the main output volume
+   - Or change the sample rate (Mix > Routing > Sample Rate)
+   - Or toggle phantom power on an input
+3. Stop tcpdump
+
+**What to look for**:
+- The OUT PTTH frame with the POST request — compare byte-for-byte to our `encode_request()` output
+- The IN PTTH response — status code, headers, body
+- Does a 204 (No Content) response have a body? What about the footer?
+- Does the device send an unsolicited NREK notification after the POST? (would answer Gap #10)
+- **Gaps #4, #5, #10**
+
+### Scenario 5: Concurrent PTTH + NREK
+
+**What to capture**: Both channels active simultaneously.
+
+**Procedure**:
+1. Start tcpdump: `sudo tcpdump -i usbmon7 -w captures/05-concurrent.pcap -s 0`
+2. Open the MOTU web UI (this starts NREK long-polling)
+3. While the UI is open, rapidly change several settings in succession
+4. Capture for 60 seconds
+5. Stop tcpdump
+
+**What to look for**:
+- Are PTTH and NREK frames interleaved on the wire?
+- Do they use different `session_id` values?
+- Are `msg_seq` counters independent per channel?
+- Does a PING/PONG exchange apply to one channel or both?
+- **Gap #7** (channel concurrency)
+
+### Scenario 6: Error cases
+
+**What to capture**: Device responses to invalid or malformed requests.
+
+**Procedure**:
+1. Start tcpdump: `sudo tcpdump -i usbmon7 -w captures/06-errors.pcap -s 0`
+2. In the Windows VM browser, navigate to `http://localhost:1280/<serial>/nonexistent/path`
+3. Also try `http://localhost:1280/<serial>/datastore/invalid/deep/path`
+4. Stop tcpdump
+
+**What to look for**:
+- Does the device return a 404 in the binary codec? What does the response frame look like?
+- Are there any protocol-level error frames (special flag values, etc.)?
+- **Gap #5** (error responses)
+
+### Scenario 7: Reconnection
+
+**What to capture**: Disconnecting and reconnecting to observe session reset.
+
+**Procedure**:
+1. Start tcpdump: `sudo tcpdump -i usbmon7 -w captures/07-reconnect.pcap -s 0`
+2. With the MOTU web UI open, physically unplug the USB cable (or detach from VM)
+3. Wait 5 seconds
+4. Reconnect
+5. Wait for the driver to re-establish the connection
+6. Stop tcpdump
+
+**What to look for**:
+- Does the driver send a new CONNECT, or resume with the old session?
+- Do sequence counters reset?
+- **Gap #6** (sequence strictness)
+
+### Scenario 8: Idle keepalive timing
+
+**What to capture**: PING/PONG cadence when the connection is idle.
+
+**Procedure**:
+1. Start tcpdump: `sudo tcpdump -i usbmon7 -w captures/08-idle-keepalive.pcap -s 0`
+2. Ensure the Windows VM has the MOTU device connected but no web UI open
+3. Let it sit idle for 5 minutes
+4. Stop tcpdump
+
+**What to look for**:
+- How frequently does the driver send PINGs? (interval in seconds)
+- Are there any unsolicited IN data frames?
+- Does the device ever initiate communication?
+- **Gaps #6, #10**
+
+## Analysis Workflow
+
+After capturing, use `analyze-capture.py` extended for pcap input, or use Wireshark directly:
+
+### In Wireshark
+
+1. Open the pcap file
+2. Apply display filter: `usb.endpoint_address == 0x04 || usb.endpoint_address == 0x83`
+3. For each bulk transfer, examine the "Leftover Capture Data" field — this is the raw payload
+4. First 4 bytes = outer header (seq, flags, total_len)
+5. If flags == 0x82: CONNECT. If flags == 0x81: PING. If flags == 0x00 and len == 8: PONG.
+6. If flags == 0x80 (OUT data) or 0x00 with len > 8 (IN data): decode inner header at bytes 4-31
+7. Payload starts at byte 32
+
+### Converting pcap to JSONL for analyze-capture.py
+
+```bash
+# Use tshark to extract bulk transfer data from pcap
+tshark -r captures/02-get-datastore.pcap \
+  -Y "usb.endpoint_address == 0x04 || usb.endpoint_address == 0x83" \
+  -T json \
+  -e usb.endpoint_address -e usb.data_len -e usb.capdata \
+  > captures/02-get-datastore.json
+```
+
+Or write a converter script (TODO: `scripts/pcap-to-jsonl.py`).
